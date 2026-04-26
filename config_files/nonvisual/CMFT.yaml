@@ -1,0 +1,26 @@
+# Full CMFT: MFT + CLIP 5th stream + shared MLP alignment (co-learning)
+model_opts:
+  model: CMFT
+  obs_input_type: ['behavior', 'bbox', 'vehicle_act', 'scene']
+  apply_class_weights: True
+  normalize_boxes: False
+  generator: True
+  dataset: jaad
+
+net_opts:
+  num_hidden_units: 128
+  num_heads: 4
+  num_layers: 2
+  dropout: 0.1
+  clip_features_dir: clip_embeddings
+  use_clip: True
+  use_shared_mlp: True
+
+exp_opts:
+  datasets: [jaad_beh, jaad_all]
+  batch_size: [2, 2]
+  epochs: [40, 40]
+  lr: [1.0e-04, 1.0e-04]
+
+data_opts:
+  seq_type: nonvisual

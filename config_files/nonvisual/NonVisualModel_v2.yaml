@@ -1,0 +1,26 @@
+model_opts:
+  model: NonVisualModel
+  obs_input_type: ['bbox', 'vehicle_act', 'scene']
+  apply_class_weights: True
+  normalize_boxes: False
+  generator: True
+
+net_opts:
+  num_hidden_units: 128
+  num_heads: 4
+  num_layers: 2
+  dropout: 0.1
+
+exp_opts:
+  datasets: [jaad_beh,jaad_all]
+  batch_size: [2,2]
+  epochs: [40,40]
+  lr: [5.0e-07,5.0e-07]
+
+
+data_opts:
+  #fstride: 1
+  #subset: default
+  #data_split_type: default
+  seq_type: nonvisual      
+  #min_track_size: 16

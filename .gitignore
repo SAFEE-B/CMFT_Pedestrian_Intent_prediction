@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Data and embeddings
+clip_embeddings/
+data/
+JAAD_clips/
+
+# Dataset caches
+*.pkl
+*.h5
+*.hdf5
+
+# Model weights
+*.weights.h5
+*.keras
+saved_model/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Env
+.env
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
