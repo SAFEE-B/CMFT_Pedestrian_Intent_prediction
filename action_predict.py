@@ -2003,6 +2003,34 @@ class NonVisualModel_v5(ActionPredict):
         callbacks = self.get_callbacks(learning_scheduler, model_path) or []
         callbacks = [cb for cb in callbacks if not isinstance(cb, tf.keras.callbacks.ModelCheckpoint)]
 
+        monitor = 'val_accuracy' if data_val is not None else 'accuracy'
+        callbacks.append(tf.keras.callbacks.ModelCheckpoint(
+            filepath=model_path,
+            monitor=monitor,
+            save_best_only=True,
+            mode='max',
+            verbose=1
+        ))
+        class StopAfterPerfect(tf.keras.callbacks.Callback):
+            """Stop training only after accuracy reaches 1.0 and stays there for `patience` epochs."""
+            def __init__(self, monitor='accuracy', patience=5):
+                super().__init__()
+                self.monitor = monitor
+                self.patience = patience
+                self._perfect_count = 0
+
+            def on_epoch_end(self, epoch, logs=None):
+                val = logs.get(self.monitor, 0.0)
+                if val >= 1.0:
+                    self._perfect_count += 1
+                    if self._perfect_count >= self.patience:
+                        print(f'\nEpoch {epoch+1}: acc=1.0 for {self.patience} epochs, stopping.')
+                        self.model.stop_training = True
+                else:
+                    self._perfect_count = 0
+
+        if getattr(self, 'use_early_stopping', False):
+            callbacks.append(StopAfterPerfect(monitor=monitor, patience=5))
 
         # Train
         history = train_model.fit(
@@ -2016,7 +2044,9 @@ class NonVisualModel_v5(ActionPredict):
             callbacks=callbacks
         )
 
-        train_model.save(model_path)
+        # Save final weights only if no best checkpoint was saved (e.g. all epochs failed)
+        if not os.path.exists(model_path):
+            train_model.save(model_path)
 
         # Save configs
         model_opts_path, _ = get_path(**path_params, file_name='model_opts.pkl')
@@ -2124,12 +2154,14 @@ class CMFT(NonVisualModel_v5):
                  clip_embedding_dim=514,
                  use_clip=True,
                  use_shared_mlp=True,
+                 use_early_stopping=False,
                  **kwargs):
         super().__init__(**kwargs)
         self.clip_features_dir = clip_features_dir
         self.clip_embedding_dim = clip_embedding_dim
         self.use_clip = use_clip
         self.use_shared_mlp = use_shared_mlp
+        self.use_early_stopping = use_early_stopping
 
     def _load_clip_sequence(self, img_paths, ped_ids, bboxes, dataset_name):
         """

@@ -1,4 +1,4 @@
-# CMFT ablation: CLIP stream only, no shared MLP
+# MFT baseline: no CLIP, no shared MLP
 model_opts:
   model: CMFT
   obs_input_type: ['behavior', 'bbox', 'vehicle_act', 'scene']
@@ -13,7 +13,7 @@ net_opts:
   num_layers: 2
   dropout: 0.1
   clip_features_dir: clip_embeddings
-  use_clip: True
+  use_clip: False
   use_shared_mlp: False
   use_early_stopping: True
 
