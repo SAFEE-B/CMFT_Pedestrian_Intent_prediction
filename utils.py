@@ -606,7 +606,7 @@ class SinusoidalPositionEncoding(tf.keras.layers.Layer):
 
     def call(self, x):
         seq_len = tf.shape(x)[1]
-        return x + self.pos_encoding[:, :seq_len, :]
+        return x + tf.cast(self.pos_encoding[:, :seq_len, :], dtype=x.dtype)
 
     def get_config(self):
         config = super().get_config()

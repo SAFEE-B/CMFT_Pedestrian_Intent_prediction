@@ -21,6 +21,8 @@ from tensorflow.keras.layers import Input, Embedding, Dense, Dropout, LayerNorma
 from tensorflow.keras.optimizers import Adam, SGD, RMSprop
 from tensorflow.keras import regularizers
 from tensorflow.keras import backend as K
+from tensorflow.keras import mixed_precision
+mixed_precision.set_global_policy('mixed_float16')
 from tensorflow.keras.utils import Sequence
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.metrics import roc_auc_score, roc_curve, precision_recall_curve
@@ -1892,41 +1894,36 @@ class NonVisualModel_v5(ActionPredict):
         cls_layer = LearnableCLSTokens(data_types, self.hidden_dim)
         cls_tokens_dict, yellow_cls = cls_layer(tf.shape(inputs[0])[0])
 
-        # Initial embedding (prepend learnable CLS in the first layer)
+        # Initial embedding: each stream has a different feature dim so must project individually
+        n_streams = len(data_types)
         for t in data_types:
             x = layer_input[t]
             x = Dense(self.hidden_dim)(x)
             x = Dropout(self.dropout_rate)(x)
-
-            # Prepend learnable CLS token (sequence becomes [B, T+1, D])
-            x = tf.concat([cls_tokens_dict[t], x], axis=1)
+            x = tf.concat([cls_tokens_dict[t], x], axis=1)  # [B, T+1, D]
             layer_input[t] = x
 
         # Stacked Transformer layers
         for l in range(self.num_layers):
             if l < self.num_layers - 1:
-                # ===== 普通分支 self-attn =====
                 cls_tokens = []
                 token_backbone = {}
                 new_layer_input = {}
 
                 for t in data_types:
                     x = layer_input[t]
-                    x_res = x
                     x = self.position_layer(x)
                     x = MultiHeadAttention(self.num_heads, self.hidden_dim // self.num_heads)(x, x)
                     token_backbone[t] = x
                     cls_tokens.append(x[:, 0:1, :])
 
-                # ===== 普通 CC-Attn =====
                 CC_Attn_input = tf.concat([yellow_cls] + cls_tokens, axis=1)
                 CC_Attn_input = self.position_layer(CC_Attn_input)
                 CC_Attn_out = MultiHeadAttention(
                     self.num_heads, self.hidden_dim // self.num_heads
                 )(CC_Attn_input, CC_Attn_input)
-                # 更新黄色 CLS
                 yellow_cls = CC_Attn_out[:, 0:1, :]
-                # ===== 分支 CLS + FFN 更新 =====
+
                 for i, t in enumerate(data_types):
                     branch_token = token_backbone[t][:, 1:, :]
                     CC_Attn_cls = CC_Attn_out[:, i + 1:i + 2, :]
@@ -1939,11 +1936,10 @@ class NonVisualModel_v5(ActionPredict):
                     new_layer_input[t] = x
                 layer_input = new_layer_input
             else:
-                # ===== 最后一层特殊逻辑 (只更新 CLS，不更新分支 token) =====
                 new_cls_tokens = []
                 for t in data_types:
-                    x = layer_input[t]  # [B, T+1, D]
-                    cls_q = x[:, 0:1, :]  # 只取 CLS 作为 Q
+                    x = layer_input[t]
+                    cls_q = x[:, 0:1, :]
                     kv = x
                     cls_updated = MultiHeadAttention(
                         self.num_heads, self.hidden_dim // self.num_heads
@@ -1952,16 +1948,16 @@ class NonVisualModel_v5(ActionPredict):
                 KV = tf.concat([yellow_cls] + new_cls_tokens, axis=1)
                 att_vec = attention_3d_block(
                     hidden_states=KV,
-                    query_vec=yellow_cls,  # yellow_cls 作为 query
+                    query_vec=yellow_cls,
                     dense_size=self.hidden_dim,
                     modality='final'
                 )
-                yellow_cls = tf.expand_dims(att_vec, axis=1)  # 变成 [B, 1, hidden_dim]
+                yellow_cls = tf.expand_dims(att_vec, axis=1)
         # Final: use global yellow CLS -> MLP for classification
         final_cls = yellow_cls[:, 0, :]
         out = Dense(self.hidden_dim, activation='relu')(final_cls)
         out = Dropout(0.2)(out)
-        out = Dense(1, activation='sigmoid')(out)
+        out = Dense(1, activation='sigmoid', dtype='float32')(out)
         return Model(inputs=inputs, outputs=out)
 
     def train(self, data_train,
@@ -1975,11 +1971,11 @@ class NonVisualModel_v5(ActionPredict):
 
         learning_scheduler = learning_scheduler or {}
 
-        # Match fast pipeline batch size for fair comparison; scale LR linearly
-        target_batch_size = 8
-        if batch_size < target_batch_size:
-            lr = lr * (target_batch_size / batch_size)
-            batch_size = target_batch_size
+        # Scale batch size to 8 for better GPU utilization; scale LR linearly
+        fast_batch_size = 8
+        if batch_size < fast_batch_size:
+            lr = lr * (fast_batch_size / batch_size)
+            batch_size = fast_batch_size
 
         # Build save paths
         model_folder_name = time.strftime("%d%b%Y-%Hh%Mm%Ss")
@@ -2003,7 +1999,7 @@ class NonVisualModel_v5(ActionPredict):
         train_model = self.get_model(data_train['data_params'])
         class_w = self.class_weights(model_opts['apply_class_weights'], data_train['count'])
         opt = self.get_optimizer(optimizer)(lr=lr)
-        train_model.compile(loss='binary_crossentropy', optimizer=opt, metrics=['accuracy'])
+        train_model.compile(loss='binary_crossentropy', optimizer=opt, metrics=['accuracy'], jit_compile=True)
 
 
         callbacks = self.get_callbacks(learning_scheduler, model_path) or []
@@ -2306,12 +2302,13 @@ class CMFT(NonVisualModel_v5):
         cls_layer = LearnableCLSTokens(data_types, self.hidden_dim)
         cls_tokens_dict, yellow_cls = cls_layer(tf.shape(inputs[0])[0])
 
-        # Project each stream into hidden_dim and prepend CLS token
+        # Initial embedding: each stream has a different feature dim so must project individually
+        n_streams = len(data_types)
         for t in data_types:
             x = layer_input[t]
             x = Dense(self.hidden_dim)(x)
             x = Dropout(self.dropout_rate)(x)
-            x = tf.concat([cls_tokens_dict[t], x], axis=1)
+            x = tf.concat([cls_tokens_dict[t], x], axis=1)  # [B, T+1, D]
             layer_input[t] = x
 
         # Shared MLP alignment layer (same weights applied to each context token)
@@ -2339,12 +2336,12 @@ class CMFT(NonVisualModel_v5):
                 if self.use_shared_mlp:
                     aligned_cls = []
                     for tok in cls_tokens:
-                        tok_sq = tok[:, 0, :]         # [B, D]
+                        tok_sq = tok[:, 0, :]
                         tok_al = shared_dense1(tok_sq)
                         tok_al = Dropout(self.dropout_rate)(tok_al)
                         tok_al = shared_dense2(tok_al)
-                        tok_al = shared_ln(tok_al + tok_sq)   # residual
-                        aligned_cls.append(tf.expand_dims(tok_al, axis=1))  # [B, 1, D]
+                        tok_al = shared_ln(tok_al + tok_sq)
+                        aligned_cls.append(tf.expand_dims(tok_al, axis=1))
                     cls_tokens = aligned_cls
 
                 CC_Attn_input = tf.concat([yellow_cls] + cls_tokens, axis=1)
@@ -2366,7 +2363,6 @@ class CMFT(NonVisualModel_v5):
                     new_layer_input[t] = x
                 layer_input = new_layer_input
             else:
-                # Final layer: update only CLS tokens via guided attention
                 new_cls_tokens = []
                 for t in data_types:
                     x = layer_input[t]
@@ -2389,7 +2385,7 @@ class CMFT(NonVisualModel_v5):
         final_cls = yellow_cls[:, 0, :]
         out = Dense(self.hidden_dim, activation='relu')(final_cls)
         out = Dropout(0.2)(out)
-        out = Dense(1, activation='sigmoid')(out)
+        out = Dense(1, activation='sigmoid', dtype='float32')(out)
         return Model(inputs=inputs, outputs=out)
 
     def test(self, data_test, model_path='', model_file='model.h5'):

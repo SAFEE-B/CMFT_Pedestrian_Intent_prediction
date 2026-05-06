@@ -1,4 +1,3 @@
-# MFT baseline: no CLIP, no shared MLP
 model_opts:
   model: CMFT
   obs_input_type: ['behavior', 'bbox', 'vehicle_act', 'scene']
@@ -15,13 +14,13 @@ net_opts:
   clip_features_dir: clip_embeddings
   use_clip: False
   use_shared_mlp: False
-  use_early_stopping: True
+  use_early_stopping: False
 
 exp_opts:
-  datasets: [jaad_beh, jaad_all]
-  batch_size: [2, 2]
-  epochs: [60, 60]
-  lr: [5.0e-07, 5.0e-07]
+  datasets: [jaad_beh]
+  batch_size: [2]
+  epochs: [2]
+  lr: [5.0e-07]
 
 data_opts:
   seq_type: nonvisual

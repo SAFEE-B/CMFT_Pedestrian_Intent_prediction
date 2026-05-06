@@ -9,8 +9,8 @@ from numba import cuda
 import numpy as np
 from tensorflow.keras import backend as K
 
-from action_predict import action_prediction
-from action_predict import ActionPredict
+from action_predict_fast import action_prediction
+from action_predict_fast import ActionPredict
 #from new_model import NewModel, HybridModel, MultiRNN3D, MultiRNN3D_MATT
 
 from jaad_data import JAAD
