@@ -20,8 +20,8 @@ net_opts:
 exp_opts:
   datasets: [jaad_beh, jaad_all]
   batch_size: [2, 2]
-  epochs: [60, 60]
-  lr: [5.0e-07, 5.0e-07]
+  epochs: [40, 40]
+  lr: [1.0e-05, 1.0e-05]
 
 data_opts:
   seq_type: nonvisual

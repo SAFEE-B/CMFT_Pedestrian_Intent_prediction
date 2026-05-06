@@ -6,8 +6,9 @@ Usage:
     python compare.py -c config_files/nonvisual/MFT_baseline.yaml -e 5      # 5 epochs only
     python compare.py -c config_files/nonvisual/CMFT.yaml -e 10             # 10 epochs only
 
-Each pipeline runs in its own subprocess so GPU memory and Python heap are
-fully released between the original and optimized runs.
+Each (pipeline, dataset) pair runs in its own subprocess so GPU memory and
+Python heap are fully released between every run. 4 subprocesses total:
+  orig x jaad_beh  →  orig x jaad_all  →  fast x jaad_beh  →  fast x jaad_all
 """
 import os
 import sys
@@ -58,23 +59,27 @@ path_pie = "/home/zzhonghang/Pedestrian_Crossing_Intention_Prediction/data/pie"
 
 
 # ---------------------------------------------------------------------------
-# Worker entry point — only executed in subprocesses
+# Worker entry point — runs ONE dataset for ONE pipeline, then exits
 # ---------------------------------------------------------------------------
 
 def _worker_main():
     """
-    Called when this script is re-invoked as a subprocess with --worker.
-    Reads args from environment variables set by the parent, runs one pipeline,
-    writes results as JSON to the path in WORKER_OUT, then exits.
+    Invoked as:  python compare.py --worker
+    Env vars consumed:
+      WORKER_FAST        '0' or '1'
+      WORKER_CONFIG      path to yaml config file
+      WORKER_DATASET_IDX index into exp_opts.datasets list (0-based)
+      WORKER_EPOCHS      (optional) epoch override
+      WORKER_OUT         path to write JSON result for this one dataset
     """
     import os, json, time, yaml, pickle
     import numpy as np
 
     use_fast      = os.environ['WORKER_FAST'] == '1'
     config_file   = os.environ['WORKER_CONFIG']
+    dataset_idx   = int(os.environ['WORKER_DATASET_IDX'])
     epochs_str    = os.environ.get('WORKER_EPOCHS', '')
     out_path      = os.environ['WORKER_OUT']
-    xla_flags     = os.environ.get('XLA_FLAGS', '')
 
     epochs_override = int(epochs_str) if epochs_str else None
 
@@ -104,84 +109,86 @@ def _worker_main():
     tte = tte if isinstance(tte, int) else tte[1]
     configs['data_opts']['min_track_size'] = configs['model_opts']['obs_length'] + tte
 
-    all_results = []
+    dataset = model_configs['exp_opts']['datasets'][dataset_idx]
+    configs['data_opts']['sample_type'] = 'beh' if 'beh' in dataset else 'all'
+    configs['model_opts']['overlap']    = 0.6 if 'pie' in dataset else 0.8
+    configs['model_opts']['dataset']    = dataset.split('_')[0]
+    configs['train_opts']['batch_size'] = model_configs['exp_opts']['batch_size'][dataset_idx]
+    configs['train_opts']['lr']         = model_configs['exp_opts']['lr'][dataset_idx]
+    configs['train_opts']['epochs']     = (
+        epochs_override if epochs_override is not None
+        else model_configs['exp_opts']['epochs'][dataset_idx]
+    )
 
-    for dataset_idx, dataset in enumerate(model_configs['exp_opts']['datasets']):
-        configs['data_opts']['sample_type'] = 'beh' if 'beh' in dataset else 'all'
-        configs['model_opts']['overlap'] = 0.6 if 'pie' in dataset else 0.8
-        configs['model_opts']['dataset'] = dataset.split('_')[0]
-        configs['train_opts']['batch_size'] = model_configs['exp_opts']['batch_size'][dataset_idx]
-        configs['train_opts']['lr'] = model_configs['exp_opts']['lr'][dataset_idx]
-        configs['train_opts']['epochs'] = (
-            epochs_override if epochs_override is not None
-            else model_configs['exp_opts']['epochs'][dataset_idx]
-        )
+    if configs['model_opts']['dataset'] == 'pie':
+        imdb = PIE(data_path=path_pie)
+    else:
+        imdb = JAAD(data_path=path_jaad)
 
-        if configs['model_opts']['dataset'] == 'pie':
-            imdb = PIE(data_path=path_pie)
-        else:
-            imdb = JAAD(data_path=path_jaad)
+    beh_seq_train = imdb.generate_data_trajectory_sequence('train', **configs['data_opts'])
+    beh_seq_val   = imdb.generate_data_trajectory_sequence('val',   **configs['data_opts'])
+    beh_seq_test  = imdb.generate_data_trajectory_sequence('test',  **configs['data_opts'])
 
-        beh_seq_train = imdb.generate_data_trajectory_sequence('train', **configs['data_opts'])
-        beh_seq_val   = imdb.generate_data_trajectory_sequence('val',   **configs['data_opts'])
-        beh_seq_test  = imdb.generate_data_trajectory_sequence('test',  **configs['data_opts'])
+    configs['net_opts']['input_type_list'] = configs['model_opts']['obs_input_type']
+    method_class = action_prediction(configs['model_opts']['model'])(**configs['net_opts'])
 
-        configs['net_opts']['input_type_list'] = configs['model_opts']['obs_input_type']
-        method_class = action_prediction(configs['model_opts']['model'])(**configs['net_opts'])
+    train_start = time.time()
+    saved_files_path = method_class.train(
+        beh_seq_train, beh_seq_val,
+        **configs['train_opts'],
+        model_opts=configs['model_opts'],
+    )
+    train_total = time.time() - train_start
 
-        train_start = time.time()
-        saved_files_path = method_class.train(
-            beh_seq_train, beh_seq_val,
-            **configs['train_opts'],
-            model_opts=configs['model_opts'],
-        )
-        train_total = time.time() - train_start
+    # Free training data before inference — large datasets exhaust RAM otherwise
+    del beh_seq_train, beh_seq_val
+    import gc; gc.collect()
 
-        history_path = os.path.join(saved_files_path, 'history.pkl')
-        avg_epoch_s = None
-        if os.path.exists(history_path):
-            with open(history_path, 'rb') as f:
-                hist = pickle.load(f)
-            n_epochs = len(hist.get('loss', []))
-            avg_epoch_s = round(train_total / n_epochs, 2) if n_epochs > 0 else None
+    history_path = os.path.join(saved_files_path, 'history.pkl')
+    avg_epoch_s = None
+    if os.path.exists(history_path):
+        with open(history_path, 'rb') as f:
+            hist = pickle.load(f)
+        n_epochs = len(hist.get('loss', []))
+        avg_epoch_s = round(train_total / n_epochs, 2) if n_epochs > 0 else None
 
-        infer_start = time.time()
-        acc, auc, f1, precision, recall = method_class.test(beh_seq_test, saved_files_path)
-        infer_total = time.time() - infer_start
+    infer_start = time.time()
+    acc, auc, f1, precision, recall = method_class.test(beh_seq_test, saved_files_path)
+    infer_total = time.time() - infer_start
 
-        all_results.append({
-            'dataset':       dataset,
-            'train_total_s': round(train_total, 2),
-            'avg_epoch_s':   avg_epoch_s,
-            'infer_total_s': round(infer_total, 2),
-            'acc':           round(float(acc),       4),
-            'auc':           round(float(auc),       4),
-            'f1':            round(float(f1),        4),
-            'precision':     round(float(precision), 4),
-            'recall':        round(float(recall),    4),
-        })
+    result = {
+        'dataset':       dataset,
+        'train_total_s': round(train_total, 2),
+        'avg_epoch_s':   avg_epoch_s,
+        'infer_total_s': round(infer_total, 2),
+        'acc':           round(float(acc),       4),
+        'auc':           round(float(auc),       4),
+        'f1':            round(float(f1),        4),
+        'precision':     round(float(precision), 4),
+        'recall':        round(float(recall),    4),
+    }
 
     with open(out_path, 'w') as f:
-        json.dump(all_results, f)
+        json.dump(result, f)
 
 
 # ---------------------------------------------------------------------------
 # Parent helpers
 # ---------------------------------------------------------------------------
 
-def run_pipeline_subprocess(config_file, use_fast, epochs_override, log_fh, xla_flags=''):
+def _launch_one(config_file, use_fast, dataset_idx, epochs_override, log_fh, xla_flags=''):
     """
-    Launch a fresh Python subprocess to run one pipeline.
-    All subprocess stdout/stderr is streamed live to console AND to log_fh.
-    Results are returned as a list of dicts.
+    Spawn a single worker subprocess for one (pipeline, dataset) combination.
+    Streams output live. Returns the result dict.
     """
     out_fd, out_path = tempfile.mkstemp(suffix='.json', prefix='compare_worker_')
     os.close(out_fd)
 
     env = os.environ.copy()
-    env['WORKER_FAST']   = '1' if use_fast else '0'
-    env['WORKER_CONFIG'] = config_file
-    env['WORKER_OUT']    = out_path
+    env['WORKER_FAST']        = '1' if use_fast else '0'
+    env['WORKER_CONFIG']      = config_file
+    env['WORKER_DATASET_IDX'] = str(dataset_idx)
+    env['WORKER_OUT']         = out_path
     if epochs_override is not None:
         env['WORKER_EPOCHS'] = str(epochs_override)
     elif 'WORKER_EPOCHS' in env:
@@ -205,18 +212,32 @@ def run_pipeline_subprocess(config_file, use_fast, epochs_override, log_fh, xla_
 
     proc.wait()
     if proc.returncode != 0:
-        raise RuntimeError(f"Worker subprocess exited with code {proc.returncode}")
+        os.unlink(out_path)
+        raise RuntimeError(
+            f"Worker exited with code {proc.returncode} "
+            f"(pipeline={'fast' if use_fast else 'orig'}, dataset_idx={dataset_idx})"
+        )
 
     with open(out_path, 'r') as f:
-        results = json.load(f)
+        result = json.load(f)
     os.unlink(out_path)
+    return result
+
+
+def run_pipeline(config_file, use_fast, epochs_override, log_fh, xla_flags, n_datasets):
+    """Run all datasets for one pipeline, one subprocess per dataset."""
+    results = []
+    for idx in range(n_datasets):
+        results.append(_launch_one(config_file, use_fast, idx, epochs_override, log_fh, xla_flags))
     return results
 
 
-def print_comparison(orig_results, fast_results):
-    print("\n" + "=" * 95)
-    print(f"{'Dataset':<15} {'Metric':<25} {'Original':>12} {'Optimized':>12} {'Delta':>10}")
-    print("=" * 95)
+def print_comparison(orig_results, fast_results, tee_fn=None):
+    out = tee_fn or print
+
+    out("\n" + "=" * 95)
+    out(f"{'Dataset':<15} {'Metric':<25} {'Original':>12} {'Optimized':>12} {'Delta':>10}")
+    out("=" * 95)
 
     for orig, fast in zip(orig_results, fast_results):
         ds = orig['dataset']
@@ -234,13 +255,13 @@ def print_comparison(orig_results, fast_results):
             o_val = orig.get(key)
             f_val = fast.get(key)
             if o_val is None or f_val is None:
-                print(f"{ds:<15} {label:<25} {'N/A':>12} {'N/A':>12} {'N/A':>10}")
+                out(f"{ds:<15} {label:<25} {'N/A':>12} {'N/A':>12} {'N/A':>10}")
                 continue
             delta = f_val - o_val
             fmt = '.4f' if isinstance(delta, float) and abs(delta) < 100 else '.2f'
             delta_str = f"{delta:+{fmt}}"
-            print(f"{ds:<15} {label:<25} {o_val:>12} {f_val:>12} {delta_str:>10}")
-        print("-" * 95)
+            out(f"{ds:<15} {label:<25} {o_val:>12} {f_val:>12} {delta_str:>10}")
+        out("-" * 95)
 
 
 def usage():
@@ -254,7 +275,7 @@ def usage():
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    # Subprocess worker mode — invoked by the parent process
+    # Subprocess worker mode
     if '--worker' in sys.argv:
         _worker_main()
         sys.exit(0)
@@ -283,6 +304,11 @@ if __name__ == '__main__':
         usage()
         sys.exit(2)
 
+    # Read dataset count from config so the parent knows how many subprocesses to spawn
+    with open(config_file, 'r') as f:
+        _mc = yaml.safe_load(f)
+    n_datasets = len(_mc['exp_opts']['datasets'])
+
     timestamp = time.strftime("%d%b%Y-%Hh%Mm%Ss")
     log_path = f"compare_log_{timestamp}.txt"
     log_fh = open(log_path, 'w', encoding='utf-8')
@@ -294,6 +320,7 @@ if __name__ == '__main__':
         log_fh.flush()
 
     tee(f"Logging to {log_path}")
+    tee(f"Config: {config_file}  |  datasets: {_mc['exp_opts']['datasets']}")
 
     if epochs_override is not None:
         tee(f"\n>>> Quick comparison mode: {epochs_override} epochs per dataset")
@@ -302,21 +329,19 @@ if __name__ == '__main__':
 
     xla_flags = os.environ.get('XLA_FLAGS', '')
 
-    tee("\n>>> Running ORIGINAL pipeline (float32) in subprocess...")
-    orig_results = run_pipeline_subprocess(
-        config_file, use_fast=False,
-        epochs_override=epochs_override,
-        log_fh=log_fh, xla_flags=xla_flags,
-    )
+    tee("\n>>> Running ORIGINAL pipeline (float32) — one subprocess per dataset...")
+    orig_results = run_pipeline(config_file, use_fast=False,
+                                epochs_override=epochs_override,
+                                log_fh=log_fh, xla_flags=xla_flags,
+                                n_datasets=n_datasets)
 
-    tee("\n>>> Running OPTIMIZED pipeline (float16 + XLA + batch=8) in subprocess...")
-    fast_results = run_pipeline_subprocess(
-        config_file, use_fast=True,
-        epochs_override=epochs_override,
-        log_fh=log_fh, xla_flags=xla_flags,
-    )
+    tee("\n>>> Running OPTIMIZED pipeline (float16 + XLA + batch=8) — one subprocess per dataset...")
+    fast_results = run_pipeline(config_file, use_fast=True,
+                                epochs_override=epochs_override,
+                                log_fh=log_fh, xla_flags=xla_flags,
+                                n_datasets=n_datasets)
 
-    print_comparison(orig_results, fast_results)
+    print_comparison(orig_results, fast_results, tee_fn=tee)
 
     out_path = f"comparison_results_{timestamp}.yaml"
     with open(out_path, 'w') as f:

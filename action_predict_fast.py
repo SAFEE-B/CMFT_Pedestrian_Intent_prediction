@@ -1395,7 +1395,7 @@ class NonVisualModel(ActionPredict):
         # Create and compile model
         train_model = self.get_model(data_train['data_params'])
         class_w = self.class_weights(model_opts['apply_class_weights'], data_train['count'])
-        opt = self.get_optimizer(optimizer)(lr=lr)
+        opt = self.get_optimizer(optimizer)(lr=lr, clipnorm=1.0)
         train_model.compile(loss='binary_crossentropy', optimizer=opt, metrics=['accuracy'])
 
         callbacks = self.get_callbacks(learning_scheduler, model_path) or []
@@ -1696,7 +1696,7 @@ class NonVisualModel_v4(ActionPredict):
         # Create and compile model
         train_model = self.get_model(data_train['data_params'])
         class_w = self.class_weights(model_opts['apply_class_weights'], data_train['count'])
-        opt = self.get_optimizer(optimizer)(lr=lr)
+        opt = self.get_optimizer(optimizer)(lr=lr, clipnorm=1.0)
         train_model.compile(loss='binary_crossentropy', optimizer=opt, metrics=['accuracy'])
 
         callbacks = self.get_callbacks(learning_scheduler, model_path) or []
@@ -1971,10 +1971,10 @@ class NonVisualModel_v5(ActionPredict):
 
         learning_scheduler = learning_scheduler or {}
 
-        # Scale batch size to 8 for better GPU utilization; scale LR linearly
+        # Scale batch size to 8 for better GPU utilization; keep LR unchanged
+        # (fp16 mixed precision overflows at linearly-scaled LR values)
         fast_batch_size = 8
         if batch_size < fast_batch_size:
-            lr = lr * (fast_batch_size / batch_size)
             batch_size = fast_batch_size
 
         # Build save paths
@@ -1998,7 +1998,7 @@ class NonVisualModel_v5(ActionPredict):
         # Create and compile model
         train_model = self.get_model(data_train['data_params'])
         class_w = self.class_weights(model_opts['apply_class_weights'], data_train['count'])
-        opt = self.get_optimizer(optimizer)(lr=lr)
+        opt = self.get_optimizer(optimizer)(lr=lr, clipnorm=1.0)
         train_model.compile(loss='binary_crossentropy', optimizer=opt, metrics=['accuracy'], jit_compile=True)
 
 
@@ -2237,10 +2237,11 @@ class CMFT(NonVisualModel_v5):
             images_all = data['image']   # [N, T]
             pids_all   = data['ped_id']  # [N, T]
             bboxes_all = data['box']     # [N, T, 4]
-            clip_features = np.array([
-                self._load_clip_sequence(img_seq, pid_seq, bbox_seq, dataset_name)
-                for img_seq, pid_seq, bbox_seq in zip(images_all, pids_all, bboxes_all)
-            ], dtype=np.float32)  # [N, T, 514]
+            n_samples = len(images_all)
+            T = len(images_all[0])
+            clip_features = np.empty((n_samples, T, 514), dtype=np.float32)
+            for i, (img_seq, pid_seq, bbox_seq) in enumerate(zip(images_all, pids_all, bboxes_all)):
+                clip_features[i] = self._load_clip_sequence(img_seq, pid_seq, bbox_seq, dataset_name)
             data_input.append(clip_features)
             data_sizes.append(clip_features.shape[1:])
             data_types.append('clip')
